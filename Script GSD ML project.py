@@ -602,7 +602,7 @@ sns.set(style="whitegrid")
 
 # Load the dataset from the provided Excel file
 df = pd.read_excel(
-    "/Users/joostgroen/Documents/GSD machine learning/FINAL MODELS FOR PAPER/FINAL MODEL 2/CATBOOST SMOTE 100% FS 200/acylcarnitines tm 2005 - only gsd1a.xlsx")
+    "/path/to/data/file")
 
 df = clean_data(df)
 df = process_columns(df)
