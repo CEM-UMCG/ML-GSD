@@ -1,7 +1,9 @@
 #!/usr/bin/env python
 # coding: utf-8§
 # Initial imports
+import glob
 from collections import defaultdict
+from pathlib import Path
 from typing import Tuple
 
 import imblearn
@@ -12,6 +14,8 @@ import pandas as pd
 import seaborn as sns
 import shap
 from catboost import CatBoostClassifier, CatBoostError, Pool
+from pdf2image import convert_from_path
+from pyhtml2pdf import converter
 from scipy import stats
 from sklearn.impute import KNNImputer
 from sklearn.metrics import (
@@ -19,6 +23,7 @@ from sklearn.metrics import (
 )
 from sklearn.model_selection import (StratifiedKFold, StratifiedGroupKFold)
 from sklearn.utils import resample
+
 
 def split_dataset(dataset, group_column, event_column, test_size=0.20, random_state=42):
     X = dataset.drop(event_column, axis=1)  # drop the target variable
@@ -82,6 +87,7 @@ def knn_impute(train_set, test_set):
 
     return train_set_imputed, test_set_imputed
 
+
 def feature_creation(train_set, test_set, ratios):
     for ratio_name in ratios:
         num_col, denom_col = ratio_name.split('/')[0], ratio_name.split('/')[1].split(' ')[0]
@@ -99,57 +105,10 @@ def feature_creation(train_set, test_set, ratios):
     return train_set, test_set
 
 
-def stratified_bootstrap_metrics(true_labels, predicted_probs, n_bootstraps=10000, alpha=0.05, beta=4.0):
-    true_labels = np.array(true_labels).astype(int)
-    predicted_probs = np.array(predicted_probs)
-    roc_aucs, pr_aucs, f4_scores = [], [], []
-    pos_mask = true_labels == 1
-    neg_mask = true_labels == 0
-    for _ in range(n_bootstraps):
-        pos_indices = resample(np.where(pos_mask)[0], replace=True)
-        neg_indices = resample(np.where(neg_mask)[0], replace=True)
-        indices = np.concatenate([pos_indices, neg_indices])
-        bootstrap_true_labels = true_labels[indices]
-        bootstrap_predicted_probs = predicted_probs[indices]
-        # ROC curve
-        fpr, tpr, _ = roc_curve(bootstrap_true_labels, bootstrap_predicted_probs)
-        roc_aucs.append(auc(fpr, tpr))
-        # PR curve
-        precision, recall, _ = precision_recall_curve(bootstrap_true_labels, bootstrap_predicted_probs)
-        # Sort by recall
-        sort_idx = np.argsort(recall)
-        pr_aucs.append(auc(recall[sort_idx], precision[sort_idx]))
-        predicted_labels = (bootstrap_predicted_probs > 0.5).astype(int)
-        f4_scores.append(fbeta_score(bootstrap_true_labels, predicted_labels, beta=4))
-
-    # Calculate the AUC mean and Confidence intervals, F4 mean
-    lower = max(0.0, 100 * (alpha / 2))
-    upper = min(100.0, 100 * (1 - alpha / 2))
-    if len(roc_aucs) > 0 and len(pr_aucs) > 0 and len(f4_scores) > 0:
-        return {
-            "roc_auc": {
-                "mean": np.mean(roc_aucs),
-                "lower": np.percentile(roc_aucs, lower),
-                "upper": np.percentile(roc_aucs, upper)
-            },
-            "pr_auc": {
-                "mean": np.mean(pr_aucs),
-                "lower": np.percentile(pr_aucs, lower),
-                "upper": np.percentile(pr_aucs, upper)
-            },
-            "f4_score": {
-                "mean": np.mean(f4_scores),
-                "lower": np.percentile(f4_scores, lower),
-                "upper": np.percentile(f4_scores, upper)
-            }
-        }
-    else:
-        return "Not enough data to calculate metrics"
-
-
 # Function to perform hyperparameter tuning and feature selection
-def tune_and_select_features(X, y, n_splits=10, trial_runs=1):
+def tune_and_select_features(X, y, n_splits=10, trial_runs=200):
     def objective(trial):
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
         # Hyperparameter space
         param_grid = {
             'iterations': trial.suggest_int('iterations', 100, 1000),
@@ -250,13 +209,13 @@ def tune_and_select_features(X, y, n_splits=10, trial_runs=1):
 
     # Extracting feature importances
     feature_importances = best_model.get_feature_importance()
-    selected_features = X.columns[feature_importances > np.percentile(feature_importances, 0)]
+    selected_features = X.columns[feature_importances > np.percentile(feature_importances, 30)]
 
     return best_params, feature_importances, selected_features
 
 
 # Main nested cross-validation function
-def nested_cv(dataset, n_splits=10, trial_runs=100):
+def nested_cv(dataset, n_splits=10, trial_runs=200):
     outer_cv = StratifiedKFold(n_splits=n_splits, random_state=42, shuffle=True)
     metrics = defaultdict(list)
     all_true_labels = []
@@ -281,7 +240,8 @@ def nested_cv(dataset, n_splits=10, trial_runs=100):
         y_train_cv = y_train_cv[X_train_cv.index]
 
         # Get best params and feature importances
-        best_params, feature_importances, selected_features = tune_and_select_features(X_train_cv, y_train_cv, trial_runs=trial_runs)
+        best_params, feature_importances, selected_features = tune_and_select_features(X_train_cv, y_train_cv,
+                                                                                       trial_runs=trial_runs)
         aggregate_params.append(best_params)
         aggregate_feature_importances.append(feature_importances)
 
@@ -321,7 +281,7 @@ def nested_cv(dataset, n_splits=10, trial_runs=100):
         all_true_labels.extend(y_val_cv.tolist())
         all_predicted_probs.extend(predicted_probs.tolist())
 
-    return metrics, aggregate_feature_importances, all_true_labels, all_predicted_probs
+    return metrics, aggregate_params, aggregate_feature_importances, all_true_labels, all_predicted_probs
 
 
 def calculate_stats(metrics):
@@ -345,34 +305,33 @@ def calculate_stats(metrics):
         print(f"{metric}: Mean = {mean_score:.3f}, Std = {std_dev:.3f}, 95% CI: [{ci_lower:.3f}, {ci_upper:.3f}]")
     return calculated_stats
 
+
+def calculate_best_params(aggregate_params):
+    best_params = {}
+    for key in aggregate_params[0]:
+        if key in ['iterations', 'depth', 'border_count']:
+            best_params[key] = int(round(np.mean([d[key] for d in aggregate_params])))
+        else:
+            best_params[key] = np.mean([d[key] for d in aggregate_params])
+    return best_params
+
+
+def identify_important_features(aggregate_feature_importances, train_set):
+    aggregate_feature_importances_array = np.array(aggregate_feature_importances)
+    mean_feature_importances = np.mean(aggregate_feature_importances_array, axis=0)
+    feature_threshold = np.percentile(aggregate_feature_importances, 30)
+
+    selected_features = [
+        feature for feature, importance in
+        zip(train_set.drop(columns=['PAID', 'AfnameDatum', 'GSD I']).columns, mean_feature_importances)
+        if importance > feature_threshold
+    ]
+    return selected_features
+
+
 def train_final_model(X_train: pd.DataFrame, X_test: pd.DataFrame, y_train: pd.Series, y_test: pd.Series,
-                      selected_features: list, best_params: dict, smote) -> Tuple[
+                      best_params: dict, smote) -> Tuple[
     CatBoostClassifier, np.array, np.array]:
-    """
-    Function to conduct training on the final model
-
-    Args:
-    X_train : pd.DataFrame - Training feature dataset
-    X_test : pd.DataFrame - Testing feature dataset
-    y_train : pd.Series - Training target dataset
-    y_test : pd.Series - Testing target dataset
-    selected_features : list - Selected features for training
-    best_params : dict - Optimal params found for CatBoost Classifier
-    smote : SMOTE() - Class to handle oversampling
-
-    Returns:
-    best_cb : CatBoostClassifier - The trained best model
-    y_pred_proba : np.array - Predicted probabilities of test data
-    y_pred : np.array - Predicted values of test data
-    """
-
-    # Drop unused columns
-    X_train = X_train.drop(columns=['PAID', 'AfnameDatum'])
-    X_test = X_test.drop(columns=['PAID'])
-
-    # Select features
-    X_train = X_train[selected_features]
-    X_test = X_test[selected_features]
 
     # SMOTE oversampling
     X_train, y_train = smote.fit_resample(X_train, y_train)
@@ -390,6 +349,54 @@ def train_final_model(X_train: pd.DataFrame, X_test: pd.DataFrame, y_train: pd.S
     y_pred = best_cb.predict(test_pool)
 
     return best_cb, y_pred_proba, y_pred
+
+
+def stratified_bootstrap_metrics(true_labels, predicted_probs, n_bootstraps=10000, alpha=0.05, beta=4.0):
+    true_labels = np.array(true_labels).astype(int)
+    predicted_probs = np.array(predicted_probs)
+    roc_aucs, pr_aucs, f4_scores = [], [], []
+    pos_mask = true_labels == 1
+    neg_mask = true_labels == 0
+    for _ in range(n_bootstraps):
+        pos_indices = resample(np.where(pos_mask)[0], replace=True)
+        neg_indices = resample(np.where(neg_mask)[0], replace=True)
+        indices = np.concatenate([pos_indices, neg_indices])
+        bootstrap_true_labels = true_labels[indices]
+        bootstrap_predicted_probs = predicted_probs[indices]
+        # ROC curve
+        fpr, tpr, _ = roc_curve(bootstrap_true_labels, bootstrap_predicted_probs)
+        roc_aucs.append(auc(fpr, tpr))
+        # PR curve
+        precision, recall, _ = precision_recall_curve(bootstrap_true_labels, bootstrap_predicted_probs)
+        # Sort by recall
+        sort_idx = np.argsort(recall)
+        pr_aucs.append(auc(recall[sort_idx], precision[sort_idx]))
+        predicted_labels = (bootstrap_predicted_probs > 0.5).astype(int)
+        f4_scores.append(fbeta_score(bootstrap_true_labels, predicted_labels, beta=4))
+
+    # Calculate the AUC mean and Confidence intervals, F4 mean
+    lower = max(0.0, 100 * (alpha / 2))
+    upper = min(100.0, 100 * (1 - alpha / 2))
+    if len(roc_aucs) > 0 and len(pr_aucs) > 0 and len(f4_scores) > 0:
+        return {
+            "roc_auc": {
+                "mean": np.mean(roc_aucs),
+                "lower": np.percentile(roc_aucs, lower),
+                "upper": np.percentile(roc_aucs, upper)
+            },
+            "pr_auc": {
+                "mean": np.mean(pr_aucs),
+                "lower": np.percentile(pr_aucs, lower),
+                "upper": np.percentile(pr_aucs, upper)
+            },
+            "f4_score": {
+                "mean": np.mean(f4_scores),
+                "lower": np.percentile(f4_scores, lower),
+                "upper": np.percentile(f4_scores, upper)
+            }
+        }
+    else:
+        return "Not enough data to calculate metrics"
 
 
 def calculate_precision_recall(all_true_labels, all_predicted_probs):
@@ -418,6 +425,7 @@ def calculate_weighted_fbeta_scores(all_true_labels, all_predicted_probs, beta, 
 
 
 def plot_f_beta_scores(thresholds, weighted_fbeta_scores, optimal_threshold, optimal_f_beta, title):
+    plt.figure(figsize=(8, 6))
     plt.plot(thresholds, weighted_fbeta_scores, label='F4 Score')
     plt.scatter(optimal_threshold, optimal_f_beta, color='red', label='Optimal Threshold')
     plt.title(f'F4 Score by Threshold ({title})')
@@ -425,7 +433,9 @@ def plot_f_beta_scores(thresholds, weighted_fbeta_scores, optimal_threshold, opt
     plt.ylabel('F4 Score')
     plt.legend()
     plt.grid(True)
-    plt.savefig(f'optimal_threshold_F4_{title}.pdf')
+    plt.savefig(f'optimal_threshold_F4_{title}.pdf', format='pdf')
+    plt.savefig(f'optimal_threshold_F4_{title}.tiff', format='tiff', dpi=300)
+    plt.savefig(f'optimal_threshold_F4_{title}.eps', format='eps')
     plt.show()
 
 
@@ -443,12 +453,16 @@ def plot_confusion_matrix(conf_matrix, title):
                   .reshape(2, 2))
 
     plt.figure(figsize=(8, 6))
+    sns.set(font_scale=1.4)
     sns.heatmap(percentages_row, annot=labels_row, fmt='', cmap="Blues",
-                cbar_kws={'label': 'Percentage of Total per Class'})
-    plt.title(f"Confusion Matrix at optimal F4 score ({title})")
-    plt.ylabel('Actual GSD Ia')
-    plt.xlabel('Predicted GSD Ia')
-    plt.savefig(f'confusion_matrix_optimal_threshold_F4_{title}.pdf')
+                cbar_kws={'label': 'Percentage of Total per Class'}, annot_kws={"size": 16})
+    plt.title(f"Confusion Matrix at optimal F4 score ({title})", fontsize=20)
+    plt.ylabel('Actual GSD Ia', fontsize=16)
+    plt.xlabel('Predicted GSD Ia', fontsize=16)
+    plt.tick_params(labelsize=14)
+    plt.savefig(f'confusion_matrix_optimal_threshold_F4_{title}.pdf', format='pdf')
+    plt.savefig(f'confusion_matrix_optimal_threshold_F4_{title}.tiff', format='tiff', dpi=300)
+    plt.savefig(f'confusion_matrix_optimal_threshold_F4_{title}.eps', format='eps')
     plt.show()
 
 
@@ -479,13 +493,13 @@ def calculate_optimal_threshold(all_true_labels, all_predicted_probs, beta, titl
     return optimal_threshold, y_pred_optimal
 
 
-def plot_roc_pr_curves(y_test, y_pred_proba, roc_auc_mean, roc_auc_ci, pr_auc_mean, pr_auc_ci, positive_rate, title,
-                       file_name='ROC_PR_curve_with_CI.pdf'):
+def plot_roc_pr_curves(y_test, y_pred_proba, roc_auc_mean, roc_auc_ci, pr_auc_mean, pr_auc_ci, positive_rate, title):
     plt.figure(figsize=(14, 7))
 
     # Calculate ROC and Precision-Recall values
     fpr, tpr, _ = roc_curve(y_test, y_pred_proba)
     precision, recall, _ = precision_recall_curve(y_test, y_pred_proba)
+    sns.set(font_scale=1.4)
 
     # Plotting ROC Curve
     plt.subplot(1, 2, 1)
@@ -493,10 +507,11 @@ def plot_roc_pr_curves(y_test, y_pred_proba, roc_auc_mean, roc_auc_ci, pr_auc_me
     plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
     plt.xlim([0.0, 1.0])
     plt.ylim([0.0, 1.05])
-    plt.xlabel('False Positive Rate')
-    plt.ylabel('True Positive Rate')
-    plt.title(f'Receiver Operating Characteristic Curve {title}')
-    plt.legend(loc="lower right")
+    plt.xlabel('False Positive Rate', fontsize=16)
+    plt.ylabel('True Positive Rate', fontsize=16)
+    plt.title(f'Receiver Operating Characteristic Curve {title}', fontsize=20)
+    plt.legend(loc="lower right", fontsize=14)
+    plt.tick_params(labelsize=14)
 
     # Plotting Precision-Recall Curve
     plt.subplot(1, 2, 2)
@@ -505,13 +520,16 @@ def plot_roc_pr_curves(y_test, y_pred_proba, roc_auc_mean, roc_auc_ci, pr_auc_me
     plt.plot([0, 1], [positive_rate, positive_rate], color='red', linestyle='--', lw=2, label='Random Classifier')
     plt.xlim([0.0, 1.0])
     plt.ylim([0.0, 1.05])
-    plt.xlabel('Recall')
-    plt.ylabel('Precision')
-    plt.title(f'Precision-Recall Curve {title}')
-    plt.legend(loc="lower left")
+    plt.xlabel('Recall', fontsize=16)
+    plt.ylabel('Precision', fontsize=16)
+    plt.title(f'Precision-Recall Curve {title}', fontsize=20)
+    plt.legend(loc="lower left", fontsize=14)
+    plt.tick_params(labelsize=14)
 
     plt.tight_layout()
-    plt.savefig(file_name)
+    plt.savefig(f'ROC_PR_curve_{title}.pdf', format='pdf')
+    plt.savefig(f'ROC_PR_curve_{title}.tiff', format='tiff', dpi=300)
+    plt.savefig(f'ROC_PR_curve_{title}.eps', format='eps')
     plt.show()
 
 
@@ -539,41 +557,11 @@ def plot_feature_importance(model, X_train, num_features=20):
     plt.xlabel('Feature Importance')
     plt.ylabel('Feature')
     plt.title(f'Top {num_features} Features')
-    plt.gca().invert_yaxis()  # To display the highest importance at the top
+    plt.gca().invert_yaxis()
     plt.show()
 
-def calculate_best_params(aggregate_params):
-    best_params = {}
-    for key in aggregate_params[0]:
-        if key in ['iterations', 'depth', 'border_count']:
-            best_params[key] = int(round(np.mean([d[key] for d in aggregate_params])))
-        else:
-            best_params[key] = np.mean([d[key] for d in aggregate_params])
-    return best_params
-
-
-def identify_important_features(aggregate_feature_importances, train_set):
-    aggregate_feature_importances_array = np.array(aggregate_feature_importances)
-    mean_feature_importances = np.mean(aggregate_feature_importances_array, axis=0)
-    feature_threshold = np.percentile(aggregate_feature_importances, 0)
-
-    selected_features = [
-        feature for feature, importance in
-        zip(train_set.drop(columns=['PAID', 'AfnameDatum', 'GSD I']).columns, mean_feature_importances)
-        if importance > feature_threshold
-    ]
-    return selected_features
 
 def visualize_instance(explainer, shap_values, X_test, sample_index, show_plot=False):
-    """
-    Function to visualize features that have the biggest impact using SHAP values
-    :param explainer: fitted SHAP Explainer
-    :param shap_values: calculated SHAP values
-    :param X_test: test data
-    :param sample_index: indices to visualize
-    :param show_plot: flag to control if plot is displayed interactively
-    :return: None
-    """
     shap.initjs()
 
     if np.isscalar(explainer.expected_value):
@@ -597,13 +585,13 @@ def visualize_instance(explainer, shap_values, X_test, sample_index, show_plot=F
         with open(filename, 'w') as f:
             shap.save_html(f, plot)
 
+
 # Using seaborn style
 sns.set(style="whitegrid")
 
-# Load the dataset from the provided Excel file
+# Data loading and preprocessing
 df = pd.read_excel(
     "/path/to/data/file")
-
 df = clean_data(df)
 df = process_columns(df)
 df = deduplicate_data(df)
@@ -690,9 +678,6 @@ if len(common_paid) == 0:
 else:
     print(f"Matching PAID numbers found in both sets: {common_paid}")
 
-# Set log level
-optuna.logging.set_verbosity(optuna.logging.WARNING)
-
 # Initialize SMOTE
 smote = imblearn.over_sampling.SVMSMOTE(sampling_strategy='minority', random_state=42)
 
@@ -701,8 +686,9 @@ aggregate_params = []
 aggregate_feature_importances = []
 
 # Run nested cross-validation
-metrics, aggregate_feature_importances, all_true_labels, all_predicted_probs = nested_cv(train_set, trial_runs=200)
+metrics, aggregate_params, aggregate_feature_importances, all_true_labels, all_predicted_probs = nested_cv(train_set, trial_runs=200)
 
+# Calculate performance of nested cross-validation
 stats = calculate_stats(metrics)
 print(stats)
 roc_auc_mean = stats['roc_auc']['mean']
@@ -712,18 +698,32 @@ pr_auc_ci = f"[{stats['pr_auc']['ci_lower']:.3f}, {stats['pr_auc']['ci_upper']:.
 positive_rate = np.mean(all_true_labels)
 title = "Nested CV"
 plot_roc_pr_curves(all_true_labels, all_predicted_probs, roc_auc_mean, roc_auc_ci, pr_auc_mean, pr_auc_ci,
-                   positive_rate, title)
+                   positive_rate, title="Nested CV")
 calculate_optimal_threshold(all_true_labels, all_predicted_probs, beta=4, title='Nested CV')
 
+
+# Selecting best hyperparameters
 best_params = calculate_best_params(aggregate_params)
 print("Best Parameters:", best_params)
 
+# Selecting best features
 selected_features = identify_important_features(aggregate_feature_importances, train_set)
 print("Selected Features:", selected_features)
 
-best_cb, y_pred_proba, y_pred = train_final_model(X_train, X_test, y_train, y_test, selected_features,
-                                                        best_params, smote)
+# Drop unused columns
+PAID_test_df = X_test[['PAID']].copy()
+X_train = X_train.drop(columns=['PAID', 'AfnameDatum'])
+X_test = X_test.drop(columns=['PAID'])
 
+# Use selected features from nested cross-validation
+X_train = X_train[selected_features]
+X_test = X_test[selected_features]
+
+# Train final model and test on held-out test set
+best_cb, y_pred_proba, y_pred = train_final_model(X_train, X_test, y_train, y_test,
+                                                  best_params, smote)
+
+# Bootstrapping to calculate performance on test set with confidence intervals
 results = stratified_bootstrap_metrics(y_test, y_pred_proba, n_bootstraps=10000, beta=4)
 
 roc_auc_mean = results['roc_auc']['mean']
@@ -747,32 +747,37 @@ print(f"ROC AUC Mean of final model on test set: {roc_auc_mean:.3f}, 95% CI: {ro
 print(f"PR AUC Mean of final model on test set: {pr_auc_mean:.3f}, 95% CI: {pr_auc_ci}")
 print(f"F4 score of final model on test set: {f4_mean:.3f}, 95% CI: {f4_ci}")
 
-plot_roc_pr_curves(y_test, y_pred_proba, roc_auc_mean, roc_auc_ci, pr_auc_mean, pr_auc_ci, positive_rate, title)
+# Plot ROC and PR curves
+plot_roc_pr_curves(y_test, y_pred_proba, roc_auc_mean, roc_auc_ci, pr_auc_mean, pr_auc_ci, positive_rate, title="Test set")
 
-X_train = X_train.drop(columns=['PAID', 'AfnameDatum'])
+# Plot feature importances
 plot_feature_importance(best_cb, X_train)
 
+# Determine optimal threshold where F4 score is highest
 optimal_threshold, y_pred_optimal = calculate_optimal_threshold(y_test, y_pred_proba, beta=4, title=title)
 
+# Determine which samples were FN and FP
 y_test = y_test.reindex(X_test.index)
 FP_rows = np.where((y_test.values == 0) & (y_pred_optimal == 1))
 FN_rows = np.where((y_test.values == 1) & (y_pred_optimal == 0))
+TP_rows = np.where((y_test.values == 1) & (y_pred_optimal == 1))
 
-PAID_test_df = X_test[['PAID']].copy()
-FP_PAID = PAID_test_df.iloc[FP_rows]
-FN_PAID = PAID_test_df.iloc[FN_rows]
+FP_test = X_test.iloc[FP_rows]
+FN_test = X_test.iloc[FN_rows]
+TP_test = X_test.iloc[TP_rows]
 
-FP_PAIDs = FP_PAID.index.tolist()
-FN_PAIDs = FN_PAID.index.tolist()
-FP_FN_PAIDs = FP_PAIDs + FN_PAIDs
+FP_PAIDs = FP_test.index.tolist()
+FN_PAIDs = FN_test.index.tolist()
+TP_PAIDs = TP_test.index.tolist()
+FP_FN_PAIDs = FP_PAIDs + FN_PAIDs + TP_PAIDs
 
 # Print PAID values
-print("False Positives PAIDs: ", FP_PAID)
-print("False Negatives PAIDs: ", FN_PAID)
+print("False Positives PAIDs: ", FP_test)
+print("False Negatives PAIDs: ", FN_test)
+print("True Positives PAIDs: ", TP_test)
 
 # Calculate SHAP values and make plots
 explainer = shap.Explainer(best_cb)
-X_test = X_test.drop(columns=['PAID'])
 shap_values = explainer.shap_values(X_test)
 
 shap_values_for_positive_class = shap_values[1]
@@ -785,8 +790,27 @@ for paid in FP_FN_PAIDs:
     position_index = X_test.index.get_loc(paid)
     visualize_instance(explainer, shap_values, X_test, position_index, show_plot=False)
 
+html_files = glob.glob("/Users/joostgroen/Documents/GSD machine learning/PAPER/CATBOOST/CATBOOST SMOTE 70% FS/*.html")
+
+for html_file in html_files:
+    html_file_url = Path(html_file).absolute().as_uri()
+
+    pdf_file = html_file.replace('.html', '.pdf')
+
+    try:
+        converter.convert(html_file_url, pdf_file)
+        images = convert_from_path(pdf_file)
+        tiff_file = pdf_file.replace('.pdf', '.tiff')
+        eps_file = pdf_file.replace('.pdf', '.eps')
+        images[0].save(tiff_file, 'TIFF')
+        images[1].save(eps_file, 'EPS')
+    except Exception as e:
+        print(f"Failed to convert {html_file} to PDF/TIFF: {e}")
+
 # Create SHAP summary plot
 shap.summary_plot(shap_values, X_test, show=False, max_display=15)
 fig = plt.gcf()
-fig.set_size_inches(20, 8)
-plt.savefig('SHAP.pdf')
+fig.set_size_inches(20, 10)
+plt.savefig('SHAP.pdf', format='pdf')
+plt.savefig('SHAP.tiff', format='tiff', dpi=300)
+plt.savefig('SHAP.eps', format='eps')
